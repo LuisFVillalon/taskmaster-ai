@@ -51,6 +51,7 @@ async def plan_tasks(new_task: TaskCreate):
         subtasks = await create_subtasks_with_llm(
             active_tasks=active_tasks,
             new_task=new_task,
+            created_task=created_task
         )
     except HTTPException:
         raise
@@ -66,8 +67,4 @@ async def plan_tasks(new_task: TaskCreate):
     #     async with httpx.AsyncClient(timeout=20.0) as client:
     #         await client.post(f"{BACKEND_URL}/create-task", json=subtask)
 
-    return {
-        "message": "Task plan created successfully",
-        "parent_task_id": created_task["id"],
-        # "subtasks_created": len(subtasks)
-    }
+    return {"new_task": jsonable_encoder(created_task), "subtasks": subtasks}

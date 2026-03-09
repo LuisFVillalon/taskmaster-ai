@@ -49,7 +49,7 @@ Each item must be:
 """.strip()
 
 
-async def create_subtasks_with_llm(active_tasks: list[Task], new_task: TaskCreate):
+async def create_subtasks_with_llm(active_tasks: list[Task], new_task: TaskCreate, created_task: Task):
 
     active_workload_by_day = build_active_workload_by_day(active_tasks)
 
@@ -154,6 +154,7 @@ Do NOT include estimated_time, due_date, due_time, complexity, tags, or any extr
         description = semantic_items[i].get("description") or ""
 
         final_subtasks.append({
+            "parent_task_id": created_task['id'],
             "title": title,
             "description": description,
             "category": new_task.category,
@@ -163,6 +164,5 @@ Do NOT include estimated_time, due_date, due_time, complexity, tags, or any extr
             "complexity": new_task.complexity or 3,
             "tags": new_task.tags if new_task.tags else [],
         })
-    print(final_subtasks)
     return final_subtasks
 
