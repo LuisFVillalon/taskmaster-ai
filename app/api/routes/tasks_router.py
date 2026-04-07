@@ -1,7 +1,11 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel
+from typing import Any
 from app.schemas.task_schema import Task, TaskCreate
 from app.services.createAITaskPlan import create_subtasks_with_llm
+from app.services.createDailyBriefing import create_daily_briefing
+from app.services.getLearningResources import get_learning_resources
 import httpx
 import os
 from dotenv import load_dotenv
@@ -48,10 +52,10 @@ async def plan_tasks(new_task: TaskCreate):
 
     # ── 3. Generate subtasks via LLM (outside the backend client block) ───
     try:
-        subtasks = await create_subtasks_with_llm(
+        result = await create_subtasks_with_llm(
             active_tasks=active_tasks,
             new_task=new_task,
-            created_task=created_task
+            created_task=created_task,
         )
     except HTTPException:
         raise
@@ -59,12 +63,47 @@ async def plan_tasks(new_task: TaskCreate):
         print("LLM error type:", type(e).__name__)
         print("LLM error message:", str(e))
         import traceback
-        traceback.print_exc()  # prints the full stack trace
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"LLM service error: {str(e)}")
 
     # ── 4. Persist subtasks ────────────────────────────────────────────────
-    # for subtask in subtasks:
+    # for subtask in result["subtasks"]:
     #     async with httpx.AsyncClient(timeout=20.0) as client:
     #         await client.post(f"{BACKEND_URL}/create-task", json=subtask)
 
-    return {"new_task": jsonable_encoder(created_task), "subtasks": subtasks}
+    return {
+        "new_task": jsonable_encoder(created_task),
+        "subtasks": result["subtasks"],
+        "overload_warning": result["overload_warning"],  # None or a human-readable string
+    }
+
+
+# ── Daily Briefing ────────────────────────────────────────────────────────────
+
+class DailyBriefingRequest(BaseModel):
+    tasks: list[dict[str, Any]] = []
+    notes: list[dict[str, Any]] = []
+
+
+@router.post("/daily-briefing")
+async def daily_briefing(request: DailyBriefingRequest):
+    try:
+        text = await create_daily_briefing(request.tasks, request.notes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Briefing generation failed: {str(e)}")
+    return {"briefing": text}
+
+
+# ── Learning Resources ────────────────────────────────────────────────────────
+
+class LearningResourcesRequest(BaseModel):
+    note_content: str
+
+
+@router.post("/learning-resources")
+async def learning_resources(request: LearningResourcesRequest):
+    try:
+        result = await get_learning_resources(request.note_content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Resource generation failed: {str(e)}")
+    return result

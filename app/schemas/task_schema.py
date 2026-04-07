@@ -19,7 +19,7 @@ class TaskBase(BaseModel):
     estimated_time: Optional[float] = None
     complexity: Optional[int] = None
     parent_task_id: Optional[int] = None
-    user_id: Optional[int] = None
+    user_id: Optional[str] = None
 
     tags: List[Tag] = []
 
