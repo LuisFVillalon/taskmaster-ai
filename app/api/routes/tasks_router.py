@@ -198,7 +198,13 @@ async def schedule_task_endpoint(
     preference_busy: list[tuple[datetime, datetime]] = []
     constraint_summary: str = ""
     if raw_prefs:
-        scan = now.date()
+        # Start one day before `now` so that overnight windows whose *start*
+        # fell on the previous calendar day are still captured.
+        # Example: a "Friday 21:00 → 08:00" preference generates the interval
+        # (Fri 21:00, Sat 08:00).  Without the -1, a Saturday 01:00 run would
+        # never scan Friday and the interval would be silently omitted, leaving
+        # Sat 01:00–08:00 appearing free when it should be busy.
+        scan = now.date() - timedelta(days=1)
         deadline_date = (deadline + timedelta(days=1)).date()
         while scan <= deadline_date:
             js_dow = (scan.weekday() + 1) % 7
