@@ -194,7 +194,9 @@ async def schedule_task_endpoint(
     # p_end is placed on the *next* calendar day so the busy interval correctly
     # spans midnight.  The gap-finder receives datetime objects and handles
     # cross-midnight spans naturally via its day-by-day clipping logic.
+    _DOW_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
     preference_busy: list[tuple[datetime, datetime]] = []
+    constraint_summary: str = ""
     if raw_prefs:
         scan = now.date()
         deadline_date = (deadline + timedelta(days=1)).date()
@@ -216,30 +218,54 @@ async def schedule_task_endpoint(
                     pass
             scan += timedelta(days=1)
 
+        # Build a human-readable summary of the distinct preference rules so
+        # the LLM can name specific constraints in its reasoning field.
+        seen: set[tuple] = set()
+        parts: list[str] = []
+        for p in raw_prefs:
+            key = (p.get("day_of_week"), p.get("start_time"), p.get("end_time"))
+            if key in seen:
+                continue
+            seen.add(key)
+            dow   = _DOW_NAMES[p.get("day_of_week", 0)]
+            label = f" ({p['label']})" if p.get("label") else ""
+            parts.append(f"{dow} {p['start_time']}–{p['end_time']}{label}")
+        if parts:
+            constraint_summary = "Recurring blackout windows: " + "; ".join(parts) + "."
+
     # ── Phase 1b + 2: gap-finder → LLM slot selection ─────────────────────
     try:
         work_block_payload = await schedule_task(
-            task_id         = request.task_id,
-            title           = request.title,
-            due_date_str    = request.due_date,
-            estimated_hours = request.estimated_hours,
-            complexity      = request.complexity,
-            tags            = request.tags,
-            calendar_events = calendar_events,
-            preference_busy = preference_busy,
+            task_id             = request.task_id,
+            title               = request.title,
+            due_date_str        = request.due_date,
+            estimated_hours     = request.estimated_hours,
+            complexity          = request.complexity,
+            tags                = request.tags,
+            calendar_events     = calendar_events,
+            preference_busy     = preference_busy,
+            constraint_summary  = constraint_summary,
         )
     except ValueError as exc:
         msg = str(exc)
-        if msg == "no_capacity":
+        if msg == "no_available_slots":
+            if constraint_summary:
+                user_message = (
+                    "No available work blocks found before this deadline. "
+                    "Your recurring blackout windows are consuming all available time in this window. "
+                    "Consider adjusting a blackout window, extending the deadline, or breaking the task into smaller pieces."
+                )
+            else:
+                user_message = (
+                    "No available work blocks found before this deadline. "
+                    "Consider adjusting the deadline or splitting the task into smaller pieces."
+                )
             raise HTTPException(
                 status_code=422,
                 detail={
                     "schedulable": False,
-                    "reason":      "no_capacity",
-                    "message": (
-                        "No available work blocks found before this deadline. "
-                        "Consider adjusting the deadline or splitting the task into smaller pieces."
-                    ),
+                    "reason":      "no_available_slots",
+                    "message":     user_message,
                 },
             )
         raise HTTPException(status_code=400, detail=msg)

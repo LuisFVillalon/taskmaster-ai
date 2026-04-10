@@ -169,10 +169,13 @@ async def pick_best_slot(
     estimated_hours: float,
     due_date_str: str,
     candidates: list[dict],
+    constraint_summary: str = "",
 ) -> dict:
     """
     Ask the model to choose from pre-validated candidates.
     The model sees human-readable slot labels; it never manipulates timestamps.
+    `constraint_summary` describes active blackout windows so the LLM can name
+    the specific constraint when reasoning about a suboptimal slot.
     Returns {"slot": <chosen candidate dict>, "reasoning": str, "confidence": float}.
     """
     slots_text = "\n".join(
@@ -181,14 +184,24 @@ async def pick_best_slot(
         for i, s in enumerate(candidates)
     )
 
+    constraint_line = (
+        f"Active availability constraints: {constraint_summary}\n"
+        if constraint_summary
+        else ""
+    )
+
     prompt = (
         f'Task: "{task_title}"\n'
         f"Tags: {', '.join(task_tags) if task_tags else 'none'}\n"
         f"Estimated work time: {estimated_hours:.1f} h\n"
-        f"Deadline: {due_date_str}\n\n"
-        f"Available slots:\n{slots_text}\n\n"
+        f"Deadline: {due_date_str}\n"
+        f"{constraint_line}"
+        f"\nAvailable slots:\n{slots_text}\n\n"
         "Choose the single best slot for this work. "
         "Reason about the task's nature (from title and tags) and the time needed. "
+        "If the best slot is suboptimal (e.g. late evening) because earlier times "
+        "were blocked by the listed availability constraints, name the constraint "
+        "explicitly in your reasoning so the user understands why. "
         "Return slot_index (0-based integer), a one-sentence reasoning, "
         "and a confidence score between 0.0 and 1.0."
     )
@@ -228,6 +241,7 @@ async def schedule_task(
     tags: list[str],
     calendar_events: list[dict],
     preference_busy: list[tuple[datetime, datetime]] | None = None,
+    constraint_summary: str = "",
 ) -> dict:
     """
     Orchestrate both phases and return a dict ready to POST to /work-blocks.
@@ -291,10 +305,12 @@ async def schedule_task(
     candidates = find_candidate_slots(busy, now, deadline, hours)
 
     if not candidates:
-        raise ValueError("no_capacity")
+        raise ValueError("no_available_slots")
 
     # ── Phase 2 ───────────────────────────────────────────────────────────
-    result = await pick_best_slot(title, tags, hours, due_date_str, candidates)
+    result = await pick_best_slot(
+        title, tags, hours, due_date_str, candidates, constraint_summary
+    )
 
     chosen = result["slot"]
     return {
