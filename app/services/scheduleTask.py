@@ -50,8 +50,13 @@ _DEFAULT_HOURS = 2.0
 _SYSTEM = (
     "You are a precise scheduling assistant. "
     "You receive a task description and a numbered list of pre-computed free slots. "
+    "These slots already account for the user's Google Calendar events AND their "
+    "personal recurring blackout windows (e.g. gym sessions, classes, focus blocks). "
     "Your job is to pick the single best slot — consider the nature of the work, "
     "the required time, and the urgency relative to the deadline. "
+    "If every available slot falls at a suboptimal time (e.g. late evening) because "
+    "the user's preferred hours were blocked by their own availability settings, "
+    "explicitly note this trade-off in your reasoning so the user understands why. "
     "Return ONLY valid JSON with no markdown fences. "
     'Schema: {"slot_index": integer, "reasoning": string, "confidence": float}'
 )
@@ -222,6 +227,7 @@ async def schedule_task(
     complexity: int | None,
     tags: list[str],
     calendar_events: list[dict],
+    preference_busy: list[tuple[datetime, datetime]] | None = None,
 ) -> dict:
     """
     Orchestrate both phases and return a dict ready to POST to /work-blocks.
@@ -276,6 +282,10 @@ async def schedule_task(
             busy.append((ev_start, ev_end))
         except ValueError:
             continue  # skip malformed events
+
+    # ── Merge preference blackouts into busy list ─────────────────────────
+    if preference_busy:
+        busy.extend(preference_busy)
 
     # ── Phase 1 ───────────────────────────────────────────────────────────
     candidates = find_candidate_slots(busy, now, deadline, hours)

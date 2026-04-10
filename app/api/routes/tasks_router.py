@@ -163,8 +163,9 @@ async def schedule_task_endpoint(
     time_min = now.isoformat()
     time_max = (deadline + timedelta(days=1)).isoformat()
 
-    # ── Phase 1a: fetch Google Calendar events ────────────────────────────
+    # ── Phase 1a: fetch Google Calendar events + availability preferences ──
     calendar_events: list[dict] = []
+    raw_prefs: list[dict] = []
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             cal_resp = await client.get(
@@ -175,9 +176,45 @@ async def schedule_task_endpoint(
             if cal_resp.status_code == 200:
                 calendar_events = cal_resp.json()
             # 403 = Google Calendar not connected; treat as empty schedule.
-            # Any other non-200 is a transient error — also fall back gracefully.
+
+            pref_resp = await client.get(
+                f"{BACKEND_URL}/availability-preferences",
+                headers=auth_headers,
+            )
+            if pref_resp.status_code == 200:
+                raw_prefs = pref_resp.json()
     except httpx.RequestError:
-        pass  # backend unreachable — proceed with empty calendar
+        pass  # backend unreachable — proceed with empty calendar/preferences
+
+    # ── Convert weekly preference blackouts to concrete busy intervals ─────
+    # Preferences use JS Date.getDay() convention: 0=Sun … 6=Sat.
+    # Python datetime.weekday(): 0=Mon … 6=Sun → convert with (weekday+1)%7.
+    #
+    # Overnight windows (end_time < start_time, e.g. "22:00"→"06:00"):
+    # p_end is placed on the *next* calendar day so the busy interval correctly
+    # spans midnight.  The gap-finder receives datetime objects and handles
+    # cross-midnight spans naturally via its day-by-day clipping logic.
+    preference_busy: list[tuple[datetime, datetime]] = []
+    if raw_prefs:
+        scan = now.date()
+        deadline_date = (deadline + timedelta(days=1)).date()
+        while scan <= deadline_date:
+            js_dow = (scan.weekday() + 1) % 7
+            for p in raw_prefs:
+                if p.get("day_of_week") != js_dow:
+                    continue
+                try:
+                    sh, sm = map(int, p["start_time"].split(":"))
+                    eh, em = map(int, p["end_time"].split(":"))
+                    p_start = datetime(scan.year, scan.month, scan.day, sh, sm, tzinfo=timezone.utc)
+                    p_end   = datetime(scan.year, scan.month, scan.day, eh, em, tzinfo=timezone.utc)
+                    # Overnight: end earlier in the day than start → end is next morning
+                    if p_end <= p_start:
+                        p_end += timedelta(days=1)
+                    preference_busy.append((p_start, p_end))
+                except (ValueError, KeyError):
+                    pass
+            scan += timedelta(days=1)
 
     # ── Phase 1b + 2: gap-finder → LLM slot selection ─────────────────────
     try:
@@ -189,6 +226,7 @@ async def schedule_task_endpoint(
             complexity      = request.complexity,
             tags            = request.tags,
             calendar_events = calendar_events,
+            preference_busy = preference_busy,
         )
     except ValueError as exc:
         msg = str(exc)
