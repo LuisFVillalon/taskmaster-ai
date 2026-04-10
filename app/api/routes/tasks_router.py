@@ -163,9 +163,11 @@ async def schedule_task_endpoint(
     time_min = now.isoformat()
     time_max = (deadline + timedelta(days=1)).isoformat()
 
-    # ── Phase 1a: fetch Google Calendar events + availability preferences ──
+    # ── Phase 1a: fetch Google Calendar events, availability preferences,
+    #              and confirmed work blocks (all treated as hard-busy time) ──
     calendar_events: list[dict] = []
     raw_prefs: list[dict] = []
+    confirmed_work_blocks: list[dict] = []
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             cal_resp = await client.get(
@@ -183,6 +185,17 @@ async def schedule_task_endpoint(
             )
             if pref_resp.status_code == 200:
                 raw_prefs = pref_resp.json()
+
+            # Confirmed work blocks are hard-busy: the user has already
+            # committed to working on something else in that slot.
+            wb_resp = await client.get(
+                f"{BACKEND_URL}/work-blocks",
+                headers=auth_headers,
+            )
+            if wb_resp.status_code == 200:
+                confirmed_work_blocks = [
+                    b for b in wb_resp.json() if b.get("status") == "confirmed"
+                ]
     except httpx.RequestError:
         pass  # backend unreachable — proceed with empty calendar/preferences
 
@@ -238,6 +251,21 @@ async def schedule_task_endpoint(
             parts.append(f"{dow} {p['start_time']}–{p['end_time']}{label}")
         if parts:
             constraint_summary = "Recurring blackout windows: " + "; ".join(parts) + "."
+
+    # ── Merge confirmed work blocks into busy list ────────────────────────
+    # These are treated identically to Google Calendar events: the user has
+    # already committed to that slot, so it must never be double-booked.
+    for wb in confirmed_work_blocks:
+        try:
+            wb_start = datetime.fromisoformat(wb["start_time"])
+            wb_end   = datetime.fromisoformat(wb["end_time"])
+            if wb_start.tzinfo is None:
+                wb_start = wb_start.replace(tzinfo=timezone.utc)
+            if wb_end.tzinfo is None:
+                wb_end = wb_end.replace(tzinfo=timezone.utc)
+            preference_busy.append((wb_start, wb_end))
+        except (ValueError, KeyError):
+            pass
 
     # ── Phase 1b + 2: gap-finder → LLM slot selection ─────────────────────
     try:
