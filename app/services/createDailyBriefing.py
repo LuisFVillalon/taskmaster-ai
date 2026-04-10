@@ -13,20 +13,24 @@ MODEL_NAME = os.getenv("OPENAI_MODEL")
 
 _SYSTEM = (
     "You are a precise productivity assistant. "
-    "You MUST acknowledge every task listed in 'tasks_due_today' — do not skip, merge, or omit any. "
-    "For each due task, use its 'verb_hint' as the opening action verb. "
-    "Output 3-4 imperative sentences that cover all deadlines, associate their tags, "
-    "and suggest preparation steps based on recent notes. "
+    "Follow this strict priority order when composing the briefing: "
+    "FIRST — if 'tasks_overdue' is non-empty, open with a direct, urgent callout of every overdue item by name; "
+    "SECOND — acknowledge every task in 'tasks_due_today', using each task's 'verb_hint' as the action verb; "
+    "THIRD — use 'total_complexity_score' to set the tone: a score above 10 signals a heavy day and warrants "
+    "a caution, a score below 5 signals a manageable day and warrants encouragement; "
+    "FOURTH — if 'relevant_notes' contains a note whose tags overlap a due or overdue task, name it explicitly "
+    "as a reference the user should consult; if no notes are relevant, skip this point. "
     "If one tag dominates the workload, warn about the imbalance. "
-    "Return plain text only — no JSON, no markdown, no bullet points."
+    "Return plain text only — no JSON, no markdown, no bullet points. "
+    "Hard limit: 3-4 sentences total."
 )
 
 _USER_PROMPT = (
     "Using the data below, write exactly 3-4 imperative sentences:\n"
-    "1. For EVERY task in 'tasks_due_today', use its 'verb_hint' and include its tags in brackets.\n"
-    "2. For urgent tasks in 'upcoming_urgent', suggest one specific preparation step to start today.\n"
-    "3. If 'tag_density.dominant_tag' is heavily represented, warn about workload imbalance.\n"
-    "4. Recommend a note from 'recent_notes' to review for a due task; if none fits, suggest creating one.\n\n"
+    "1. If 'tasks_overdue' is non-empty, name each overdue task in the very first sentence as an urgent outstanding item.\n"
+    "2. For EVERY task in 'tasks_due_today', use its 'verb_hint' and include its tags in brackets.\n"
+    "3. Let 'total_complexity_score' inform your framing: above 10 → warn the day is heavy; below 5 → affirm it is manageable.\n"
+    "4. If 'relevant_notes' has entries whose tags match a due or overdue task, cite that note by title as a useful reference.\n\n"
 )
 
 # Ordered keyword → verb mapping; first match wins
@@ -106,11 +110,23 @@ async def create_daily_briefing(tasks: list[dict], notes: list[dict]) -> str:
         if str(t.get("due_date", ""))[:10] == today_str
     ]
 
+    # Overdue: incomplete tasks with a non-empty due_date strictly before today
+    tasks_overdue = [
+        _build_task_entry(t) for t in active
+        if (d := str(t.get("due_date") or "")[:10]) and d < today_str
+    ]
+
     # Upcoming urgent tasks that are NOT due today, capped to avoid prompt bloat
     upcoming_urgent = [
         _build_task_entry(t) for t in active
         if t.get("urgent") and str(t.get("due_date", ""))[:10] != today_str
     ][:5]
+
+    # Total complexity of today's workload (each task scores 1-5; None → 0)
+    total_complexity_score = sum(
+        t.get("complexity") or 0 for t in active
+        if str(t.get("due_date", ""))[:10] == today_str
+    )
 
     # Tag density across all active tasks
     all_tags = [tag for t in active for tag in [tg.get("name", "") for tg in (t.get("tags") or [])]]
@@ -121,23 +137,39 @@ async def create_daily_briefing(tasks: list[dict], notes: list[dict]) -> str:
         if top else None
     )
 
-    recent_notes = [
+    # Smart note filtering: prefer notes that share a tag with any due or overdue
+    # task so the LLM can draw a direct connection.  Fall back to recency order
+    # when no tag overlap exists (preserves the previous behaviour).
+    priority_tags: set[str] = {
+        tag_name
+        for t in active
+        if str(t.get("due_date", ""))[:10] <= today_str  # today + overdue
+        for tag_name in [tg.get("name", "") for tg in (t.get("tags") or [])]
+    }
+    tag_matched = [
+        n for n in notes
+        if priority_tags & {tg.get("name", "") for tg in (n.get("tags") or [])}
+    ]
+    note_pool = tag_matched if tag_matched else notes
+    relevant_notes = [
         {
             "title": n.get("title", ""),
             "note_content": _strip_html(n.get("content", ""))[:300],
             "tags": [tag.get("name", "") for tag in (n.get("tags") or [])],
             "updated_date": str(n.get("updated_date", ""))[:10] if n.get("updated_date") else None,
         }
-        for n in notes
+        for n in note_pool
     ][:10]
 
     context = json.dumps(
         {
             "today": today_str,
-            "tasks_due_today": tasks_due_today,    # uncapped — all must be mentioned
-            "upcoming_urgent": upcoming_urgent,     # capped at 5
+            "tasks_due_today": tasks_due_today,        # uncapped — all must be mentioned
+            "tasks_overdue": tasks_overdue,            # incomplete tasks past their due date
+            "upcoming_urgent": upcoming_urgent,        # capped at 5
+            "total_complexity_score": total_complexity_score,  # sum of complexity for today
             "tag_density": tag_density,
-            "recent_notes": recent_notes,
+            "relevant_notes": relevant_notes,          # tag-matched, falls back to recent
         },
         separators=(",", ":"),
     )
