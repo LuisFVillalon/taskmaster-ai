@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone, date
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.encoders import jsonable_encoder
@@ -95,18 +96,41 @@ class DailyBriefingRequest(BaseModel):
 
 @router.post("/daily-briefing")
 async def daily_briefing(
-    authorization: Optional[str] = Header(default=None),
+    authorization:  Optional[str] = Header(default=None),
+    x_timezone:     Optional[str] = Header(default=None),
 ):
+    """
+    Fetch tasks, work-blocks, calendar events, and notes in parallel, then ask
+    the AI to synthesise a structured morning briefing.
+
+    x_timezone: IANA timezone string from the browser (e.g. "America/Los_Angeles").
+                Used to compute the correct UTC calendar window and to localise
+                all timestamp labels before they reach the LLM.
+    """
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization header required")
 
     auth_headers = {"Authorization": authorization}
 
-    # Time window: today 00:00 → 23:59 UTC for calendar events
-    today      = date.today()
-    today_str  = today.isoformat()
-    time_min   = datetime(today.year, today.month, today.day,  0,  0,  0, tzinfo=timezone.utc).isoformat()
-    time_max   = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=timezone.utc).isoformat()
+    # ── Resolve user timezone ─────────────────────────────────────────────────
+    # Fall back to UTC if the header is missing or unrecognised.
+    try:
+        user_tz = ZoneInfo(x_timezone) if x_timezone else ZoneInfo("UTC")
+    except (ZoneInfoNotFoundError, KeyError):
+        user_tz = ZoneInfo("UTC")
+
+    # ── Calendar event window: user's local midnight → 23:59 in UTC ──────────
+    # Example: a PT user's April 10 spans 2026-04-10T07:00Z → 2026-04-11T06:59Z.
+    # Using server date.today() (UTC) would fetch the wrong 24-hour window for
+    # users in negative-offset timezones (US, Americas).
+    now_local      = datetime.now(user_tz)
+    today_local    = now_local.date()
+    day_start_local = datetime(today_local.year, today_local.month, today_local.day,
+                                0, 0, 0, tzinfo=user_tz)
+    day_end_local   = datetime(today_local.year, today_local.month, today_local.day,
+                                23, 59, 59, tzinfo=user_tz)
+    time_min = day_start_local.astimezone(timezone.utc).isoformat()
+    time_max = day_end_local.astimezone(timezone.utc).isoformat()
 
     # ── Parallel fetch ────────────────────────────────────────────────────────
     async def _get(client: httpx.AsyncClient, url: str, **kwargs):
@@ -128,10 +152,13 @@ async def daily_briefing(
     work_blocks:     list[dict] = wb_res.json()     if wb_res     and wb_res.status_code     == 200 else []
     calendar_events: list[dict] = cal_res.json()    if cal_res    and cal_res.status_code    == 200 else []
     notes:           list[dict] = notes_res.json()  if notes_res  and notes_res.status_code  == 200 else []
-    # 403 on calendar = not connected → leave as empty list (scheduler treats all time as free)
+    # 403 on calendar = Google Calendar not connected → empty list is correct
 
     try:
-        result = await create_daily_briefing(tasks, work_blocks, calendar_events, notes)
+        result = await create_daily_briefing(
+            tasks, work_blocks, calendar_events, notes,
+            timezone_name=str(user_tz),   # e.g. "America/Los_Angeles"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Briefing generation failed: {str(e)}")
 
