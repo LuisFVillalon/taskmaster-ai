@@ -87,12 +87,13 @@ async def plan_tasks(new_task: TaskCreate):
 class DailyBriefingRequest(BaseModel):
     tasks: list[dict[str, Any]] = []
     notes: list[dict[str, Any]] = []
+    work_blocks: list[dict[str, Any]] = []
 
 
 @router.post("/daily-briefing")
 async def daily_briefing(request: DailyBriefingRequest):
     try:
-        text = await create_daily_briefing(request.tasks, request.notes)
+        text = await create_daily_briefing(request.tasks, request.notes, request.work_blocks)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Briefing generation failed: {str(e)}")
     return {"briefing": text}
