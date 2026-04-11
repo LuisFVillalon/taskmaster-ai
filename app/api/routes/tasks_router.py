@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone, date
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.encoders import jsonable_encoder
@@ -83,20 +84,58 @@ async def plan_tasks(new_task: TaskCreate):
 
 
 # ── Daily Briefing ────────────────────────────────────────────────────────────
+# The service now fetches all three data sources itself (tasks, work-blocks,
+# calendar events, notes) using the forwarded Supabase JWT.  This mirrors the
+# /schedule-task pattern and keeps the briefing server-authoritative.
 
 class DailyBriefingRequest(BaseModel):
-    tasks: list[dict[str, Any]] = []
-    notes: list[dict[str, Any]] = []
-    work_blocks: list[dict[str, Any]] = []
+    """Request body is intentionally empty — all data is fetched server-side."""
+    pass
 
 
 @router.post("/daily-briefing")
-async def daily_briefing(request: DailyBriefingRequest):
+async def daily_briefing(
+    authorization: Optional[str] = Header(default=None),
+):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+
+    auth_headers = {"Authorization": authorization}
+
+    # Time window: today 00:00 → 23:59 UTC for calendar events
+    today      = date.today()
+    today_str  = today.isoformat()
+    time_min   = datetime(today.year, today.month, today.day,  0,  0,  0, tzinfo=timezone.utc).isoformat()
+    time_max   = datetime(today.year, today.month, today.day, 23, 59, 59, tzinfo=timezone.utc).isoformat()
+
+    # ── Parallel fetch ────────────────────────────────────────────────────────
+    async def _get(client: httpx.AsyncClient, url: str, **kwargs):
+        try:
+            return await client.get(url, headers=auth_headers, **kwargs)
+        except httpx.RequestError:
+            return None
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        tasks_res, wb_res, cal_res, notes_res = await asyncio.gather(
+            _get(client, f"{BACKEND_URL}/get-tasks"),
+            _get(client, f"{BACKEND_URL}/work-blocks"),
+            _get(client, f"{BACKEND_URL}/google-calendar/events",
+                 params={"time_min": time_min, "time_max": time_max}),
+            _get(client, f"{BACKEND_URL}/get-notes"),
+        )
+
+    tasks:           list[dict] = tasks_res.json()  if tasks_res  and tasks_res.status_code  == 200 else []
+    work_blocks:     list[dict] = wb_res.json()     if wb_res     and wb_res.status_code     == 200 else []
+    calendar_events: list[dict] = cal_res.json()    if cal_res    and cal_res.status_code    == 200 else []
+    notes:           list[dict] = notes_res.json()  if notes_res  and notes_res.status_code  == 200 else []
+    # 403 on calendar = not connected → leave as empty list (scheduler treats all time as free)
+
     try:
-        text = await create_daily_briefing(request.tasks, request.notes, request.work_blocks)
+        result = await create_daily_briefing(tasks, work_blocks, calendar_events, notes)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Briefing generation failed: {str(e)}")
-    return {"briefing": text}
+
+    return {"briefing": result}
 
 
 # ── Learning Resources ────────────────────────────────────────────────────────

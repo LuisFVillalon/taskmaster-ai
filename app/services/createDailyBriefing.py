@@ -1,68 +1,97 @@
+"""
+Daily Briefing service — Chief of Staff edition.
+
+Data flow:
+  tasks_router.py fetches (in parallel):
+    • /get-tasks            → all user tasks
+    • /work-blocks          → confirmed + suggested blocks
+    • /google-calendar/events → today's calendar events (empty if not connected)
+    • /get-notes            → notes for contextual cross-referencing
+
+  This module synthesises the raw data into three pre-computed sets:
+    • scheduled_tasks   — tasks that have a confirmed work block today
+    • at_risk_tasks     — tasks due within 48 h with NO confirmed block
+    • timeline          — chronologically sorted calendar events + confirmed blocks
+                          with 'gap_minutes_to_next' so the LLM can spot tight transitions
+
+  Output: dict { "pulse": str, "timeline": str, "action_items": list[str] }
+"""
+
 import json
 import os
 import re
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 load_dotenv()
 
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client    = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL_NAME = os.getenv("OPENAI_MODEL")
 
+# ── Fallback response returned when JSON parsing fails ────────────────────────
+_FALLBACK: dict = {
+    "pulse": "Could not generate briefing — please try refreshing.",
+    "timeline": "",
+    "action_items": [],
+}
+
+# ── System prompt ─────────────────────────────────────────────────────────────
 _SYSTEM = (
-    "You are a personal productivity coach delivering a spoken morning briefing. "
-    "Your job is to narrate the user's day chronologically, weaving together scheduled work blocks, "
-    "deadlines, and priorities into a clear, actionable story. "
-    "\n\n"
-    "Follow these rules exactly:\n"
-    "1. OVERDUE — If 'tasks_overdue' is non-empty, open with an urgent callout naming each item.\n"
-    "2. SCHEDULE — Use 'schedule_today' as the spine of the narrative. For each confirmed block say: "
-    "\"You're scheduled to tackle '[Task]' from [start] to [end].\" "
-    "For suggested (not yet accepted) blocks say: \"There's an AI-suggested slot for '[Task]' at [start].\"\n"
-    "3. BREAKS — If a block has 'needs_break_before: true', weave in a break suggestion: "
-    "\"After your previous session, maybe grab a coffee before diving into [Task]!\"\n"
-    "4. UNSCHEDULED — For every task in 'unscheduled_today', flag it: "
-    "\"'[Task]' is due today but has no scheduled block — find a slot before it slips.\"\n"
-    "5. DEADLINES — Mention due-time tasks as \"due at [time]\"; date-only tasks as \"due tonight\".\n"
-    "6. TONE — Use 'total_complexity_score' to set the mood: above 10 → warn it's a heavy day; "
-    "below 5 → affirm it's manageable.\n"
-    "7. NOTES — If 'relevant_notes' tags match a due or overdue task, cite that note by title as a reference.\n"
-    "8. TAG IMBALANCE — If one tag dominates all active tasks, warn about the imbalance.\n"
-    "\n"
-    "Language register: imperative, warm, direct — like a knowledgeable friend, not a robot. "
-    "Return plain text only — no JSON, no markdown, no bullet points. "
-    "Hard limit: 4–6 sentences total."
+    "You are an elite Chief of Staff delivering a morning intelligence briefing. "
+    "Your purpose is to make the user feel prepared and in control — not overwhelmed by a list.\n\n"
+
+    "Return ONLY valid JSON with exactly these three keys:\n\n"
+
+    '"pulse": A 2–3 sentence paragraph. '
+    "Lead with overdue tasks if any exist — name them urgently. "
+    "Then assess overall day intensity: reference 'confirmed_blocks', 'at_risk_count', and "
+    "'complexity_score'. Set the emotional tone — is today a sprint or manageable?\n\n"
+
+    '"timeline": A 3–5 sentence paragraph. '
+    "Narrate the day's sequence chronologically from the 'timeline' array. "
+    "Connect adjacent items into concrete strategy: "
+    "\"Because you have [Calendar Event] at [start_label], I recommend using your "
+    "[Work Block] right after to ensure you meet [Deadline].\" "
+    "If a work block's 'gap_minutes_to_next' is ≤ 15, or it immediately follows a "
+    "calendar event with duration_minutes ≥ 60, suggest a brief break: "
+    "\"After that [N]-hour [meeting/session], grab a coffee before diving into [Task].\" "
+    "Reference specific task titles, times, and ai_reasoning from the data. "
+    "If 'timeline' is empty, note the open day as an opportunity and urge "
+    "the user to schedule the at-risk tasks now.\n\n"
+
+    '"action_items": An array of short imperative strings (≤ 15 words each), '
+    "one per entry in 'at_risk_tasks'. "
+    "Pattern: \"Schedule a block for \'[Task Title]\' — due [due_label].\" "
+    "If 'at_risk_tasks' is empty, return: "
+    "[\"All critical tasks have confirmed blocks — you\'re on track!\"]\n\n"
+
+    "Strict rules:\n"
+    "• pulse and timeline are prose — no bullet points, no markdown inside them.\n"
+    "• Only reference data explicitly provided — never invent events, tasks, or deadlines.\n"
+    "• Warm, direct, executive tone — knowledgeable friend, not a calendar app.\n"
+    "• Return raw JSON only — no code fences, no extra keys."
 )
 
-_USER_PROMPT = (
-    "Using the structured data below, write 4–6 sentences that narrate the user's day:\n"
-    "• Open with overdue tasks if any exist.\n"
-    "• Walk through 'schedule_today' in order — confirmed blocks get specific time ranges, "
-    "suggested blocks get softer language.\n"
-    "• After any block where 'needs_break_before' is true, suggest a brief break.\n"
-    "• Call out every task in 'unscheduled_today' as needing a slot today.\n"
-    "• Surface due-time deadlines from 'tasks_due_today'.\n"
-    "• Close with a tone line driven by 'total_complexity_score'.\n\n"
-)
+_USER_PROMPT = "Synthesise the briefing from this data:\n\n"
 
-# Ordered keyword → verb mapping; first match wins
+# ── Verb-hint rules (imperative action verbs) ─────────────────────────────────
 _VERB_RULES: list[tuple[list[str], str]] = [
     (["midterm", "final exam", "exam", "quiz", "test prep"], "Study for"),
     (["meeting", "sync", "standup", "stand-up", "call", "1:1", "interview"], "Attend"),
     (["report", "draft", "essay", "paper", "proposal", "write"], "Finalize"),
-    (["gym", "workout", "work out", "run", "exercise", "training", "lift"], "Complete your session for"),
+    (["gym", "workout", "work out", "run", "exercise", "training", "lift"], "Complete session for"),
     (["review", "read", "audit"], "Review"),
     (["deploy", "release", "ship", "launch"], "Deploy"),
     (["debug", "fix", "patch", "resolve", "bug"], "Fix"),
-    (["presentation", "present", "slides", "demo"], "Prepare your presentation for"),
+    (["presentation", "present", "slides", "demo"], "Prepare presentation for"),
     (["submit", "turn in", "upload", "hand in"], "Submit"),
     (["project", "build", "implement", "develop", "sprint"], "Work on"),
 ]
 
 
-def _get_verb_hint(title: str) -> str:
+def _verb_hint(title: str) -> str:
     lower = title.lower()
     for keywords, verb in _VERB_RULES:
         if any(kw in lower for kw in keywords):
@@ -74,165 +103,168 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
 
-def _priority_level(task: dict) -> str:
-    if task.get("urgent"):
-        return "high"
-    complexity = task.get("complexity") or 0
-    if complexity >= 4:
-        return "medium-high"
-    return "normal"
-
-
-def _build_task_entry(t: dict) -> dict:
-    return {
-        "title": t.get("title", ""),
-        "verb_hint": _get_verb_hint(t.get("title", "")),
-        "priority_level": _priority_level(t),
-        "urgent": t.get("urgent", False),
-        "due_date": str(t.get("due_date", ""))[:10] if t.get("due_date") else None,
-        "due_time": t.get("due_time") or None,
-        "tags": [tag.get("name", "") for tag in (t.get("tags") or [])],
-        "category": t.get("category"),
-    }
-
-
 def _format_12h(iso_str: str) -> str:
-    """Convert an ISO 8601 datetime string to a friendly '1:00 PM' label."""
+    """'2026-04-10T14:00:00+00:00'  →  '2:00 PM'"""
     try:
         dt = datetime.fromisoformat(iso_str)
         h, m = dt.hour, dt.minute
         period = "AM" if h < 12 else "PM"
-        h12 = h % 12 or 12
+        h12    = h % 12 or 12
         return f"{h12}:{m:02d} {period}" if m else f"{h12} {period}"
     except (ValueError, TypeError):
         return iso_str
 
 
-def _build_schedule_today(
-    work_blocks: list[dict],
-    task_lookup: dict[int, dict],
-    today_str: str,
-) -> tuple[list[dict], set[int]]:
+def _due_label(task: dict) -> str:
+    """Human-readable due label: '3:00 PM today', 'tomorrow', 'Apr 10', etc."""
+    due_date = str(task.get("due_date") or "")[:10]
+    due_time = task.get("due_time")
+    today_str    = date.today().isoformat()
+    tomorrow_str = (date.today() + timedelta(days=1)).isoformat()
+    if due_date == today_str:
+        if due_time:
+            return f"{_format_12h(due_time[:5])} today"  # "HH:MM" → 12h label
+        return "tonight"
+    if due_date == tomorrow_str:
+        return "tomorrow"
+    return due_date  # fall back to ISO date
+
+
+def _build_task_summary(t: dict) -> dict:
+    return {
+        "id":          t.get("id"),
+        "title":       t.get("title", ""),
+        "verb_hint":   _verb_hint(t.get("title", "")),
+        "urgent":      t.get("urgent", False),
+        "due_date":    str(t.get("due_date", ""))[:10] if t.get("due_date") else None,
+        "due_time":    t.get("due_time") or None,
+        "due_label":   _due_label(t),
+        "tags":        [tg.get("name", "") for tg in (t.get("tags") or [])],
+        "category":    t.get("category"),
+        "complexity":  t.get("complexity") or 0,
+    }
+
+
+# ── Core synthesis ────────────────────────────────────────────────────────────
+
+def _synthesize(
+    tasks:           list[dict],
+    work_blocks:     list[dict],
+    calendar_events: list[dict],
+    notes:           list[dict],
+    today_str:       str,
+    tomorrow_str:    str,
+) -> dict:
     """
-    Build a chronologically sorted list of today's work-block entries enriched
-    with human-readable times and a 'needs_break_before' flag.
-
-    Returns:
-        schedule_today  — list of block dicts ready for the LLM prompt
-        scheduled_ids   — set of task_ids that have at least one block today
+    Pre-compute the three logical sets and build the day timeline so the LLM
+    receives structured facts rather than raw API dumps.
     """
-    # Filter to today and parse start times for sorting
-    todays: list[tuple[datetime, dict]] = []
-    for wb in work_blocks:
-        if wb.get("start_time", "")[:10] != today_str:
-            continue
-        try:
-            start_dt = datetime.fromisoformat(wb["start_time"])
-            todays.append((start_dt, wb))
-        except (ValueError, KeyError):
-            pass
-
-    todays.sort(key=lambda x: x[0])
-
-    schedule_today: list[dict] = []
-    scheduled_ids: set[int] = set()
-    prev_end_dt: datetime | None = None
-
-    for start_dt, wb in todays:
-        task_id = wb.get("task_id")
-        task_info = task_lookup.get(task_id, {}) if task_id else {}
-
-        try:
-            end_dt = datetime.fromisoformat(wb["end_time"])
-            duration_minutes = int((end_dt - start_dt).total_seconds() / 60)
-        except (ValueError, KeyError):
-            end_dt = start_dt
-            duration_minutes = 0
-
-        # Flag back-to-back: previous block ended within 15 min of this one's start
-        needs_break = (
-            prev_end_dt is not None
-            and 0 <= (start_dt - prev_end_dt).total_seconds() <= 900  # ≤15 min gap
-        )
-
-        schedule_today.append({
-            "task_title": task_info.get("title", "AI Work Block"),
-            "task_tags": task_info.get("tags", []),
-            "start_time_label": _format_12h(wb["start_time"]),
-            "end_time_label": _format_12h(wb["end_time"]),
-            "duration_minutes": duration_minutes,
-            "status": wb.get("status", "suggested"),   # "confirmed" | "suggested"
-            "needs_break_before": needs_break,
-        })
-
-        if task_id:
-            scheduled_ids.add(task_id)
-
-        prev_end_dt = end_dt
-
-    return schedule_today, scheduled_ids
-
-
-async def create_daily_briefing(
-    tasks: list[dict],
-    notes: list[dict],
-    work_blocks: list[dict] | None = None,
-) -> str:
-    """
-    Build a context-aware payload from tasks, notes, and today's work blocks,
-    then ask the LLM to produce a 4-6 sentence chronological daily briefing.
-
-    Key guarantees:
-    - tasks_due_today is NEVER capped — every task due today is included.
-    - upcoming_urgent is capped at 5 to keep the prompt manageable.
-    - schedule_today is sorted chronologically with break hints.
-    - unscheduled_today = tasks due today with no work block whatsoever.
-    """
-    if work_blocks is None:
-        work_blocks = []
-
-    today_str = date.today().isoformat()  # "YYYY-MM-DD"
     active = [t for t in tasks if not t.get("completed")]
 
-    # ── Task buckets ──────────────────────────────────────────────────────────
+    # ── Task sets ─────────────────────────────────────────────────────────────
 
-    tasks_due_today = [
-        _build_task_entry(t) for t in active
-        if str(t.get("due_date", ""))[:10] == today_str
-    ]
-
-    tasks_overdue = [
-        _build_task_entry(t) for t in active
+    overdue_tasks = [
+        _build_task_summary(t) for t in active
         if (d := str(t.get("due_date") or "")[:10]) and d < today_str
     ]
 
-    upcoming_urgent = [
-        _build_task_entry(t) for t in active
-        if t.get("urgent") and str(t.get("due_date", ""))[:10] != today_str
-    ][:5]
+    # Tasks due in the next 48 h (today + tomorrow)
+    due_soon = [
+        t for t in active
+        if str(t.get("due_date") or "")[:10] in (today_str, tomorrow_str)
+    ]
 
-    total_complexity_score = sum(
-        t.get("complexity") or 0 for t in active
-        if str(t.get("due_date", ""))[:10] == today_str
-    )
+    # Confirmed work blocks for today
+    confirmed_today = [
+        wb for wb in work_blocks
+        if wb.get("status") == "confirmed"
+        and wb.get("start_time", "")[:10] == today_str
+    ]
+    confirmed_task_ids: set[int] = {
+        wb["task_id"] for wb in confirmed_today if wb.get("task_id") is not None
+    }
 
-    # ── Tag stats ─────────────────────────────────────────────────────────────
+    # Build task-id → title lookup (for enriching work block timeline entries)
+    task_by_id: dict[int, dict] = {
+        t["id"]: t for t in tasks if t.get("id") is not None
+    }
 
-    all_tags = [tag for t in active for tag in [tg.get("name", "") for tg in (t.get("tags") or [])]]
-    tag_counts = Counter(all_tags)
-    top = tag_counts.most_common(1)
-    tag_density = (
-        {"dominant_tag": top[0][0], "count": top[0][1], "total_active_tasks": len(active)}
-        if top else None
-    )
+    scheduled_tasks = [
+        _build_task_summary(t) for t in due_soon
+        if t.get("id") in confirmed_task_ids
+    ]
+    at_risk_tasks = [
+        _build_task_summary(t) for t in due_soon
+        if t.get("id") not in confirmed_task_ids
+    ]
 
-    # ── Relevant notes ────────────────────────────────────────────────────────
+    # ── Timeline ──────────────────────────────────────────────────────────────
+    # Merge today's calendar events (non-all-day) with confirmed work blocks.
+
+    raw_items: list[tuple[datetime, dict]] = []
+
+    for ev in calendar_events:
+        if ev.get("is_all_day"):
+            continue
+        start_str = ev.get("start", "")
+        if start_str[:10] != today_str:
+            continue
+        try:
+            s_dt = datetime.fromisoformat(start_str)
+            e_dt = datetime.fromisoformat(ev["end"]) if ev.get("end") else s_dt
+            raw_items.append((s_dt, {
+                "type":             "calendar_event",
+                "title":            ev.get("title", ""),
+                "start_label":      _format_12h(start_str),
+                "end_label":        _format_12h(ev.get("end", "")),
+                "duration_minutes": int((e_dt - s_dt).total_seconds() / 60),
+                "_end_dt":          e_dt,
+            }))
+        except (ValueError, KeyError):
+            pass
+
+    for wb in confirmed_today:
+        task_info  = task_by_id.get(wb.get("task_id"))
+        task_title = task_info["title"] if task_info else "Work Block"
+        task_tags  = [tg.get("name", "") for tg in (task_info.get("tags") or [])] if task_info else []
+        try:
+            s_dt = datetime.fromisoformat(wb["start_time"])
+            e_dt = datetime.fromisoformat(wb["end_time"])
+            raw_items.append((s_dt, {
+                "type":             "work_block",
+                "title":            task_title,
+                "task_tags":        task_tags,
+                "start_label":      _format_12h(wb["start_time"]),
+                "end_label":        _format_12h(wb["end_time"]),
+                "duration_minutes": int((e_dt - s_dt).total_seconds() / 60),
+                "ai_reasoning":     wb.get("ai_reasoning", ""),
+                "_end_dt":          e_dt,
+            }))
+        except (ValueError, KeyError):
+            pass
+
+    raw_items.sort(key=lambda x: x[0])
+
+    # Annotate gap_minutes_to_next so the LLM can spot tight transitions
+    timeline: list[dict] = []
+    for i, (_, item) in enumerate(raw_items):
+        if i + 1 < len(raw_items):
+            next_start = raw_items[i + 1][0]
+            gap = int((next_start - item["_end_dt"]).total_seconds() / 60)
+            item["gap_minutes_to_next"] = max(gap, 0)
+        else:
+            item["gap_minutes_to_next"] = None
+        # Remove internal datetime before JSON serialisation
+        item.pop("_end_dt", None)
+        timeline.append(item)
+
+    # ── Relevant notes (tag-matched to due/overdue tasks) ─────────────────────
 
     priority_tags: set[str] = {
-        tag_name
+        tg.get("name", "")
         for t in active
         if str(t.get("due_date", ""))[:10] <= today_str
-        for tag_name in [tg.get("name", "") for tg in (t.get("tags") or [])]
+        for tg in (t.get("tags") or [])
     }
     tag_matched = [
         n for n in notes
@@ -241,67 +273,93 @@ async def create_daily_briefing(
     note_pool = tag_matched if tag_matched else notes
     relevant_notes = [
         {
-            "title": n.get("title", ""),
-            "note_content": _strip_html(n.get("content", ""))[:300],
-            "tags": [tag.get("name", "") for tag in (n.get("tags") or [])],
-            "updated_date": str(n.get("updated_date", ""))[:10] if n.get("updated_date") else None,
+            "title":        n.get("title", ""),
+            "snippet":      _strip_html(n.get("content", ""))[:200],
+            "tags":         [tg.get("name", "") for tg in (n.get("tags") or [])],
         }
         for n in note_pool
-    ][:10]
+    ][:6]
 
-    # ── Work-block schedule ───────────────────────────────────────────────────
-    # Build a task_id → {title, tags} lookup for enriching work block entries.
-    task_lookup: dict[int, dict] = {
-        t["id"]: {
-            "title": t.get("title", ""),
-            "tags": [tg.get("name", "") for tg in (t.get("tags") or [])],
-        }
-        for t in tasks
-        if t.get("id") is not None
-    }
+    # ── Complexity score (today's tasks) ─────────────────────────────────────
 
-    schedule_today, scheduled_task_ids = _build_schedule_today(
-        work_blocks, task_lookup, today_str
+    complexity_score = sum(
+        t.get("complexity") or 0 for t in active
+        if str(t.get("due_date", ""))[:10] == today_str
     )
 
-    # Tasks due today that have zero scheduled work blocks — flag as unscheduled.
-    unscheduled_today = [
-        entry for entry in tasks_due_today
-        # Match by title since _build_task_entry dropped the id field.
-        # Cross-reference against the original active list to get task ids.
-        if not any(
-            t.get("id") in scheduled_task_ids
-            and str(t.get("due_date", ""))[:10] == today_str
-            and t.get("title") == entry["title"]
-            for t in active
-        )
-    ]
+    # ── Tag density ───────────────────────────────────────────────────────────
 
-    # ── Assemble prompt payload ───────────────────────────────────────────────
+    all_tags   = [tg for t in active for tg in [x.get("name", "") for x in (t.get("tags") or [])]]
+    tag_counts = Counter(all_tags)
+    top        = tag_counts.most_common(1)
+    tag_density = (
+        {"dominant_tag": top[0][0], "count": top[0][1], "total_active": len(active)}
+        if top else None
+    )
+
+    return {
+        "today":            today_str,
+        "tomorrow":         tomorrow_str,
+        # Scalars the LLM can reason about without counting arrays
+        "confirmed_blocks": len(confirmed_today),
+        "at_risk_count":    len(at_risk_tasks),
+        "complexity_score": complexity_score,
+        "has_calendar":     bool(calendar_events),  # tells LLM if events are real
+        # Task sets
+        "overdue_tasks":    overdue_tasks,
+        "scheduled_tasks":  scheduled_tasks,
+        "at_risk_tasks":    at_risk_tasks,
+        # Day narrative spine
+        "timeline":         timeline,
+        # Supporting context
+        "relevant_notes":   relevant_notes,
+        "tag_density":      tag_density,
+    }
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+async def create_daily_briefing(
+    tasks:           list[dict],
+    work_blocks:     list[dict],
+    calendar_events: list[dict],
+    notes:           list[dict],
+) -> dict:
+    """
+    Synthesise tasks, work blocks, calendar events, and notes into a structured
+    briefing dict: { "pulse": str, "timeline": str, "action_items": list[str] }.
+
+    The caller (tasks_router.py) is responsible for fetching all four data sources
+    from the backend before invoking this function.
+    """
+    today_str    = date.today().isoformat()
+    tomorrow_str = (date.today() + timedelta(days=1)).isoformat()
 
     context = json.dumps(
-        {
-            "today": today_str,
-            "schedule_today": schedule_today,         # chronological work blocks
-            "unscheduled_today": unscheduled_today,   # due today, no block assigned
-            "tasks_due_today": tasks_due_today,       # full list (includes scheduled)
-            "tasks_overdue": tasks_overdue,
-            "upcoming_urgent": upcoming_urgent,       # capped at 5
-            "total_complexity_score": total_complexity_score,
-            "tag_density": tag_density,
-            "relevant_notes": relevant_notes,
-        },
+        _synthesize(tasks, work_blocks, calendar_events, notes, today_str, tomorrow_str),
         separators=(",", ":"),
     )
 
     response = await client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user", "content": _USER_PROMPT + context},
+            {"role": "system",  "content": _SYSTEM},
+            {"role": "user",    "content": _USER_PROMPT + context},
         ],
-        temperature=0.4,
-        max_tokens=600,
+        response_format={"type": "json_object"},   # enforce valid JSON output
+        temperature=0.35,
+        max_tokens=700,
     )
 
-    return (response.choices[0].message.content or "").strip()
+    raw = (response.choices[0].message.content or "").strip()
+
+    try:
+        result = json.loads(raw)
+        # Normalise: ensure all three keys are present
+        return {
+            "pulse":        str(result.get("pulse", "")),
+            "timeline":     str(result.get("timeline", "")),
+            "action_items": list(result.get("action_items", [])),
+        }
+    except (json.JSONDecodeError, TypeError):
+        return _FALLBACK.copy()
