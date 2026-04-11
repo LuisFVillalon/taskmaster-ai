@@ -9,13 +9,17 @@ Data flow:
     • /get-notes              → notes for contextual cross-referencing
 
   This module synthesises the raw data into three pre-computed sets:
-    • scheduled_tasks   — tasks that have a confirmed OR suggested work block today
-    • at_risk_tasks     — tasks due within 48 h with NO work block at all
-    • timeline          — calendar events + confirmed blocks sorted chronologically
+    • scheduled_tasks   — tasks due in the next 48 h that have a confirmed/suggested block
+    • at_risk_tasks     — tasks due in the next 48 h with NO block at all
+    • timeline          — calendar events + confirmed blocks for TODAY, sorted chronologically
                           with gap_minutes_to_next for tight-transition detection
 
-  All timestamps are converted to the user's local timezone (passed as an IANA
-  string from the frontend via X-Timezone header) before any label is generated.
+  All timestamps are converted to the user's local timezone BEFORE being labelled,
+  so the LLM receives pre-localised strings and must never convert them.
+
+  The system prompt is built dynamically per request so the LLM's temporal anchor
+  (current date + time) lives at the highest-priority level — in the system turn —
+  not buried in the data payload where it competes with raw ISO strings.
 
   Output: dict { "pulse": str, "timeline": str, "action_items": list[str] }
 """
@@ -41,45 +45,86 @@ _FALLBACK: dict = {
     "action_items": [],
 }
 
-# ── System prompt ─────────────────────────────────────────────────────────────
-_SYSTEM = (
-    "You are an elite Chief of Staff delivering a morning intelligence briefing. "
-    "Your purpose is to make the user feel prepared and in control — not overwhelmed.\n\n"
+# ── Static body of the system prompt ─────────────────────────────────────────
+# The temporal header (current date/time, today, tomorrow) is prepended
+# dynamically in _make_system_prompt() so the LLM treats it as ground truth.
 
+_SYSTEM_BODY = (
+    "You are an elite Chief of Staff delivering a morning intelligence briefing. "
+    "Your purpose is to make the user feel prepared and in control.\n\n"
+
+    # ── Overdue rule (explicit, with examples) ────────────────────────────────
+    "OVERDUE RULE: A task is overdue ONLY if its due_date is strictly less than "
+    "the 'today' date provided above. Use the provided 'today' value as your "
+    "sole reference — never use your own estimate of the current date. "
+    "Example: if today is 2026-04-11, a task with due_date 2026-04-12 is NOT "
+    "overdue — it is due tomorrow. Only tasks in the pre-computed 'overdue_tasks' "
+    "array are overdue; do not reclassify any other task as overdue.\n\n"
+
+    # ── Scheduling rule ───────────────────────────────────────────────────────
+    "SCHEDULING RULE: Each task in 'scheduled_tasks' and 'at_risk_tasks' carries "
+    "an 'is_scheduled' boolean and a 'scheduled_time' string. "
+    "is_scheduled=true means the task ALREADY has a confirmed or pending work block. "
+    "The 'scheduled_time' field shows exactly when that block is (e.g. 'Sun Apr 12, 8:00 AM'). "
+    "NEVER create an action item for a task where is_scheduled is true, even if the "
+    "block falls tomorrow or later in the week. "
+    "Only tasks from 'at_risk_tasks' where is_scheduled is false belong in action_items.\n\n"
+
+    # ── Completed tasks ───────────────────────────────────────────────────────
+    "COMPLETED RULE: Tasks where 'completed' is true have already been finished. "
+    "They must NEVER appear in overdue_tasks, at_risk_tasks, or action_items. "
+    "The pre-computed arrays already exclude completed tasks, but if you see one "
+    "in the raw data with completed=true, ignore it entirely.\n\n"
+
+    # ── Output schema ─────────────────────────────────────────────────────────
     "Return ONLY valid JSON with exactly these three keys:\n\n"
 
     '"pulse": A 2–3 sentence paragraph. '
     "Lead with 'overdue_tasks' if any — name them urgently by title. "
-    "Then set the day's tone: reference 'confirmed_blocks', 'at_risk_count', and "
-    "'complexity_score'. Is this a sprint or a manageable day?\n\n"
+    "Then reference 'confirmed_blocks', 'at_risk_count', and 'complexity_score' "
+    "to set the day's emotional tone.\n\n"
 
     '"timeline": A 3–5 sentence paragraph. '
     "Narrate the day chronologically using every item in the 'timeline' array. "
-    "Use ONLY the 'start_label' and 'end_label' values provided — these are already "
-    "in the user's local timezone; do not convert or adjust them. "
-    "Connect adjacent items into concrete strategy: "
-    "\"Because you have [Calendar Event] at [start_label], use your "
-    "[Work Block] right after to make progress on [Deadline].\" "
-    "If a work block has gap_minutes_to_next ≤ 15, or follows a calendar event "
-    "with duration_minutes ≥ 60, suggest a brief break by name: "
-    "\"After that [N]-hour session, grab a coffee before diving into [Task].\" "
-    "If 'timeline' is empty, note the open schedule and urge the user to assign "
-    "the at-risk tasks to a slot now.\n\n"
+    "Use ONLY the 'start_label' and 'end_label' values — they are already in the "
+    "user's local timezone; never convert or adjust them. "
+    "Connect adjacent items: \"Because you have [Event] at [start_label], your "
+    "[Work Block] right after keeps [Deadline] on track.\" "
+    "If gap_minutes_to_next ≤ 15 or a work block follows a ≥60-min event, suggest "
+    "a brief break by name. "
+    "If timeline is empty, note the open schedule and reference the at-risk tasks.\n\n"
 
-    '"action_items": An array of short imperative strings (≤ 15 words each). '
-    "CRITICAL RULE: Only include tasks from 'at_risk_tasks' where 'is_scheduled' "
-    "is false. A task with 'is_scheduled: true' ALREADY has a work block assigned "
-    "(confirmed or pending) — NEVER create an action item for it. "
-    "Pattern per entry: \"Schedule a block for \'[Task Title]\' — due [due_label].\" "
-    "If 'at_risk_tasks' is empty OR all entries have is_scheduled true, return: "
+    '"action_items": Array of short imperative strings (≤15 words each). '
+    "Include ONLY tasks from 'at_risk_tasks' where is_scheduled is false. "
+    "Pattern: \"Schedule a block for \'[Task Title]\' — due [due_label].\" "
+    "If every at_risk task has is_scheduled=true, or the array is empty, return: "
     "[\"All critical tasks have blocks assigned — you\'re on track!\"]\n\n"
 
     "Global rules:\n"
-    "• pulse and timeline are prose paragraphs — no bullet points, no markdown.\n"
-    "• Only reference data explicitly provided — never invent events or deadlines.\n"
+    "• pulse and timeline are prose paragraphs — no bullets, no markdown.\n"
+    "• Only reference explicitly provided data — never invent events or deadlines.\n"
     "• Warm, direct, executive tone — knowledgeable friend, not a calendar app.\n"
     "• Return raw JSON only — no code fences, no extra keys."
 )
+
+
+def _make_system_prompt(current_time: str, today_str: str, tomorrow_str: str) -> str:
+    """
+    Prepend a hard temporal anchor to the system prompt.
+
+    Putting the current date/time in the SYSTEM turn (not just the data payload)
+    makes it the highest-priority context for the LLM.  This prevents the model
+    from falling back to its training-cutoff date when reasoning about overdue vs
+    upcoming tasks.
+    """
+    header = (
+        f"TEMPORAL CONTEXT — treat these as absolute ground truth:\n"
+        f"  Current date and time : {current_time}\n"
+        f"  Today's date          : {today_str}\n"
+        f"  Tomorrow's date       : {tomorrow_str}\n\n"
+    )
+    return header + _SYSTEM_BODY
+
 
 _USER_PROMPT = "Synthesise the briefing from this structured data:\n\n"
 
@@ -153,8 +198,7 @@ def _format_12h(iso_str: str, tz: ZoneInfo) -> str:
     """
     Format an ISO 8601 timestamp as '9:00 AM' in the user's local timezone.
 
-    Example: '2026-04-11T16:00:00+00:00' with tz=America/Los_Angeles
-             → '9:00 AM'  (not '4:00 PM UTC')
+    Example: '2026-04-11T16:00:00+00:00' with tz=America/Los_Angeles → '9:00 AM'
     """
     try:
         dt = _to_local(iso_str, tz)
@@ -164,6 +208,36 @@ def _format_12h(iso_str: str, tz: ZoneInfo) -> str:
         return f"{h12}:{m:02d} {period}" if m else f"{h12} {period}"
     except (ValueError, TypeError):
         return iso_str
+
+
+def _scheduled_time_label(wb: dict, tz: ZoneInfo) -> str | None:
+    """
+    Return a human-readable label like 'Sun Apr 12, 8:00 AM' for a work block.
+
+    This is embedded directly on the task summary so the LLM sees the explicit
+    connection between 'Create Frontend' and its scheduled slot without having to
+    cross-reference a separate work_blocks array.
+    """
+    try:
+        dt      = _to_local(wb["start_time"], tz)
+        day_abbr   = dt.strftime("%a")   # "Sun"
+        month_abbr = dt.strftime("%b")   # "Apr"
+        h, m    = dt.hour, dt.minute
+        period  = "AM" if h < 12 else "PM"
+        h12     = h % 12 or 12
+        time_str = f"{h12}:{m:02d} {period}" if m else f"{h12} {period}"
+        return f"{day_abbr} {month_abbr} {dt.day}, {time_str}"  # "Sun Apr 12, 8:00 AM"
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def _current_time_label(dt: datetime) -> str:
+    """Format a local datetime as 'Saturday, April 11, 2026 at 10:30 AM'."""
+    h, m    = dt.hour, dt.minute
+    period  = "AM" if h < 12 else "PM"
+    h12     = h % 12 or 12
+    time_str = f"{h12}:{m:02d} {period}" if m else f"{h12} {period}"
+    return f"{dt.strftime('%A, %B')} {dt.day}, {dt.year} at {time_str}"
 
 
 def _due_label(task: dict, today_str: str, tomorrow_str: str) -> str:
@@ -190,7 +264,7 @@ def _due_label(task: dict, today_str: str, tomorrow_str: str) -> str:
     if due_date == tomorrow_str:
         return "tomorrow"
 
-    return due_date  # fall back to ISO date string
+    return due_date
 
 
 def _build_task_summary(
@@ -198,22 +272,28 @@ def _build_task_summary(
     today_str: str,
     tomorrow_str: str,
     is_scheduled: bool,
+    scheduled_time: str | None = None,
 ) -> dict:
     return {
-        "id":           t.get("id"),
-        "title":        t.get("title", ""),
-        "verb_hint":    _verb_hint(t.get("title", "")),
-        "urgent":       t.get("urgent", False),
-        "due_date":     str(t.get("due_date", ""))[:10] if t.get("due_date") else None,
-        "due_time":     t.get("due_time") or None,
-        "due_label":    _due_label(t, today_str, tomorrow_str),
-        "tags":         [tg.get("name", "") for tg in (t.get("tags") or [])],
-        "category":     t.get("category"),
-        "complexity":   t.get("complexity") or 0,
-        # Explicit flag: tells the LLM whether to produce an action item for this task.
-        # True  = has a confirmed OR suggested work block → do NOT add to action_items.
-        # False = no work block at all → this is genuinely at-risk.
-        "is_scheduled": is_scheduled,
+        "id":             t.get("id"),
+        "title":          t.get("title", ""),
+        "verb_hint":      _verb_hint(t.get("title", "")),
+        "completed":      t.get("completed", False),   # guard rail: LLM must ignore completed tasks
+        "urgent":         t.get("urgent", False),
+        "due_date":       str(t.get("due_date", ""))[:10] if t.get("due_date") else None,
+        "due_time":       t.get("due_time") or None,
+        "due_label":      _due_label(t, today_str, tomorrow_str),
+        "tags":           [tg.get("name", "") for tg in (t.get("tags") or [])],
+        "category":       t.get("category"),
+        "complexity":     t.get("complexity") or 0,
+        # ── Explicit scheduling state ──────────────────────────────────────────
+        # is_scheduled=True means a confirmed OR suggested work block already
+        # exists for this task (within the 48-hour window).  The LLM must treat
+        # this as "covered" and must NOT add an action item for it.
+        "is_scheduled":   is_scheduled,
+        # scheduled_time is the pre-formatted local time of the earliest block,
+        # e.g. "Sun Apr 12, 8:00 AM".  Null when is_scheduled=False.
+        "scheduled_time": scheduled_time,
     }
 
 
@@ -225,19 +305,30 @@ def _synthesize(
     calendar_events: list[dict],
     notes:           list[dict],
     user_tz:         ZoneInfo,
-) -> dict:
+) -> tuple[dict, str]:
     """
     Pre-compute logical task sets and the day timeline.
 
-    today_str / tomorrow_str are derived from the user's local clock (via user_tz)
-    so that a PT user at 6 PM sees April 10, not the server's UTC date of April 11.
+    Returns (context_dict, system_prompt_str).
+
+    The system prompt is returned here (not at module level) because it must
+    embed the current local date/time as a hard temporal anchor.
+
+    CRITICAL FIX — 48-hour block window:
+      due_soon covers tasks due today AND tomorrow.  The block-scan window must
+      match: a task due tomorrow with a block at 8 AM tomorrow has is_scheduled=True
+      even though that block doesn't fall on today.  Narrowing the scan to
+      today_str only caused confirmed blocks to be missed, producing redundant
+      action items like "Schedule a block for Create Frontend" even when one existed.
     """
-    # ── Local date anchor ─────────────────────────────────────────────────────
+    # ── Local date/time anchor ────────────────────────────────────────────────
     now_local      = datetime.now(user_tz)
     today_local    = now_local.date()
     today_str      = today_local.isoformat()
     tomorrow_str   = (today_local + timedelta(days=1)).isoformat()
+    current_time   = _current_time_label(now_local)
 
+    # ── Active tasks (completed tasks are excluded from all analysis) ─────────
     active = [t for t in tasks if not t.get("completed")]
 
     # ── Task sets ─────────────────────────────────────────────────────────────
@@ -248,6 +339,7 @@ def _synthesize(
         if (d := str(t.get("due_date") or "")[:10]) and d < today_str
     ]
 
+    # Tasks due in the next 48 h (today + tomorrow)
     due_soon = [
         t for t in active
         if str(t.get("due_date") or "")[:10] in (today_str, tomorrow_str)
@@ -255,33 +347,57 @@ def _synthesize(
 
     # ── Work-block sets ───────────────────────────────────────────────────────
     #
-    # SCHEDULED = confirmed OR suggested blocks that fall on today in the user's
-    # local timezone.  Both statuses mean a slot is already claimed — generating
-    # an action item for such a task would be misleading and redundant.
+    # FIX: scan the SAME 48-hour window used by due_soon.
+    # A task due tomorrow (Apr 12) whose block starts Apr 12 at 08:00 must have
+    # is_scheduled=True.  Filtering blocks to today_str only misses it entirely.
     #
-    # Key: use _local_date_key() to handle the UTC-midnight edge case where a
-    # block stored as "T00:00Z" (midnight UTC) belongs to the previous local day
-    # for users west of Greenwich.
+    # scheduled_relevant = all non-dismissed blocks that land on today OR tomorrow.
+    # confirmed_today    = confirmed blocks that land on today (timeline only).
 
-    scheduled_today = [
+    relevant_dates = {today_str, tomorrow_str}
+
+    scheduled_relevant: list[dict] = [
         wb for wb in work_blocks
         if wb.get("status") in ("confirmed", "suggested")
+        and _local_date_key(wb.get("start_time", ""), user_tz) in relevant_dates
+    ]
+
+    # Build task_id → earliest block mapping so we can pass scheduled_time to summaries
+    scheduled_block_by_task: dict[int, dict] = {}
+    for wb in scheduled_relevant:
+        tid = wb.get("task_id")
+        if tid is None:
+            continue
+        if tid not in scheduled_block_by_task:
+            scheduled_block_by_task[tid] = wb
+        else:
+            # Keep the earliest block for this task
+            try:
+                if _parse_aware(wb["start_time"]) < _parse_aware(scheduled_block_by_task[tid]["start_time"]):
+                    scheduled_block_by_task[tid] = wb
+            except (ValueError, KeyError):
+                pass
+
+    scheduled_task_ids: set[int] = set(scheduled_block_by_task.keys())
+
+    # Timeline: only confirmed blocks that fall on TODAY (tomorrow's blocks are future)
+    confirmed_today: list[dict] = [
+        wb for wb in scheduled_relevant
+        if wb.get("status") == "confirmed"
         and _local_date_key(wb.get("start_time", ""), user_tz) == today_str
     ]
-    scheduled_task_ids: set[int] = {
-        wb["task_id"] for wb in scheduled_today if wb.get("task_id") is not None
-    }
 
-    # Timeline only shows confirmed blocks — suggested ones aren't committed.
-    confirmed_today = [wb for wb in scheduled_today if wb.get("status") == "confirmed"]
-
-    # ── Task-ID → full task lookup for enriching work block timeline entries ──
+    # ── Task-ID → full task lookup (for work block timeline labels) ───────────
     task_by_id: dict[int, dict] = {
         t["id"]: t for t in tasks if t.get("id") is not None
     }
 
     scheduled_tasks = [
-        _build_task_summary(t, today_str, tomorrow_str, is_scheduled=True)
+        _build_task_summary(
+            t, today_str, tomorrow_str,
+            is_scheduled=True,
+            scheduled_time=_scheduled_time_label(scheduled_block_by_task[t["id"]], user_tz),
+        )
         for t in due_soon
         if t.get("id") in scheduled_task_ids
     ]
@@ -292,9 +408,8 @@ def _synthesize(
     ]
 
     # ── Timeline ──────────────────────────────────────────────────────────────
-    # Merge today's non-all-day calendar events with confirmed work blocks.
-    # All time labels are converted to the user's local timezone before storage
-    # so the LLM receives pre-localised strings and must not adjust them.
+    # Merge today's non-all-day calendar events with today's confirmed work blocks.
+    # All time labels are pre-localised — LLM must use them verbatim.
 
     raw_items: list[tuple[datetime, dict]] = []
 
@@ -338,10 +453,8 @@ def _synthesize(
         except (ValueError, KeyError):
             pass
 
-    # Sort by UTC start time (order is the same in any timezone)
     raw_items.sort(key=lambda x: x[0])
 
-    # Annotate gap_minutes_to_next for the LLM's break-suggestion logic
     timeline: list[dict] = []
     for i, (_, item) in enumerate(raw_items):
         if i + 1 < len(raw_items):
@@ -389,25 +502,32 @@ def _synthesize(
         if top else None
     )
 
-    return {
-        "today":            today_str,
-        "tomorrow":         tomorrow_str,
-        "timezone":         str(user_tz),           # e.g. "America/Los_Angeles"
-        # Scalar signals for the LLM
+    context = {
+        # ── Temporal anchors (redundant with system prompt — belt-and-suspenders) ──
+        "current_time":     current_time,           # "Saturday, April 11, 2026 at 10:30 AM"
+        "today":            today_str,              # "2026-04-11"
+        "tomorrow":         tomorrow_str,           # "2026-04-12"
+        "timezone":         str(user_tz),           # "America/Los_Angeles"
+        # ── Scalar signals ────────────────────────────────────────────────────
         "confirmed_blocks": len(confirmed_today),
         "at_risk_count":    len(at_risk_tasks),
         "complexity_score": complexity_score,
         "has_calendar":     bool(calendar_events),
-        # Task sets (each entry carries is_scheduled so the LLM can verify)
+        # ── Task sets ─────────────────────────────────────────────────────────
+        # Each entry carries is_scheduled + scheduled_time so the LLM can verify
+        # the task-to-block connection without cross-referencing another array.
         "overdue_tasks":    overdue_tasks,
         "scheduled_tasks":  scheduled_tasks,
         "at_risk_tasks":    at_risk_tasks,
-        # Narrative spine
+        # ── Narrative spine ───────────────────────────────────────────────────
         "timeline":         timeline,
-        # Supporting context
+        # ── Supporting context ────────────────────────────────────────────────
         "relevant_notes":   relevant_notes,
         "tag_density":      tag_density,
     }
+
+    system_prompt = _make_system_prompt(current_time, today_str, tomorrow_str)
+    return context, system_prompt
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -424,20 +544,18 @@ async def create_daily_briefing(
     briefing: { "pulse": str, "timeline": str, "action_items": list[str] }.
 
     timezone_name: IANA timezone string forwarded from the browser via the
-                   X-Timezone header (e.g. "America/Los_Angeles").  Defaults to
-                   UTC so the service is still usable without the header.
+                   X-Timezone header (e.g. "America/Los_Angeles").
     """
     user_tz = _resolve_tz(timezone_name)
-    context = json.dumps(
-        _synthesize(tasks, work_blocks, calendar_events, notes, user_tz),
-        separators=(",", ":"),
+    context, system_prompt = _synthesize(
+        tasks, work_blocks, calendar_events, notes, user_tz
     )
 
     response = await client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user",   "content": _USER_PROMPT + context},
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": _USER_PROMPT + json.dumps(context, separators=(",", ":"))},
         ],
         response_format={"type": "json_object"},
         temperature=0.35,
