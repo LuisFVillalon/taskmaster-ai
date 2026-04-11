@@ -164,10 +164,10 @@ async def schedule_task_endpoint(
     time_max = (deadline + timedelta(days=1)).isoformat()
 
     # ── Phase 1a: fetch Google Calendar events, availability preferences,
-    #              and confirmed work blocks (all treated as hard-busy time) ──
+    #              and existing work blocks (all treated as hard-busy time) ──
     calendar_events: list[dict] = []
     raw_prefs: list[dict] = []
-    confirmed_work_blocks: list[dict] = []
+    existing_work_blocks: list[dict] = []
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             cal_resp = await client.get(
@@ -186,15 +186,18 @@ async def schedule_task_endpoint(
             if pref_resp.status_code == 200:
                 raw_prefs = pref_resp.json()
 
-            # Confirmed work blocks are hard-busy: the user has already
-            # committed to working on something else in that slot.
+            # Both 'suggested' and 'confirmed' work blocks occupy real time on
+            # the calendar and must be treated as busy.  Excluding 'suggested'
+            # blocks caused the scheduler to overlap its own previous suggestions
+            # when multiple tasks were scheduled before the user had a chance to
+            # accept or dismiss them.  Only 'dismissed' blocks are truly free.
             wb_resp = await client.get(
                 f"{BACKEND_URL}/work-blocks",
                 headers=auth_headers,
             )
             if wb_resp.status_code == 200:
-                confirmed_work_blocks = [
-                    b for b in wb_resp.json() if b.get("status") == "confirmed"
+                existing_work_blocks = [
+                    b for b in wb_resp.json() if b.get("status") != "dismissed"
                 ]
     except httpx.RequestError:
         pass  # backend unreachable — proceed with empty calendar/preferences
@@ -252,10 +255,11 @@ async def schedule_task_endpoint(
         if parts:
             constraint_summary = "Recurring blackout windows: " + "; ".join(parts) + "."
 
-    # ── Merge confirmed work blocks into busy list ────────────────────────
-    # These are treated identically to Google Calendar events: the user has
-    # already committed to that slot, so it must never be double-booked.
-    for wb in confirmed_work_blocks:
+    # ── Merge existing work blocks into busy list ─────────────────────────
+    # Both suggested and confirmed blocks occupy a specific time window that
+    # the scheduler already claimed.  Adding them here ensures no two tasks
+    # are ever assigned overlapping slots.
+    for wb in existing_work_blocks:
         try:
             wb_start = datetime.fromisoformat(wb["start_time"])
             wb_end   = datetime.fromisoformat(wb["end_time"])

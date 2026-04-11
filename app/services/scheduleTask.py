@@ -38,10 +38,15 @@ load_dotenv()
 _ai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 _MODEL = os.getenv("OPENAI_MODEL")
 
-# Default working-hour window (UTC).  When user timezone support is added,
+# Primary working-hour window (UTC).  When user timezone support is added,
 # these should be converted to the user's local hours before clipping.
 _WORK_START = 8   # 08:00
 _WORK_END   = 22  # 22:00
+
+# Extended window — used as a graceful-degradation fallback when no slot
+# fits inside the primary window (e.g. the day is already heavily booked).
+_WORK_START_EXTENDED = 7   # 07:00
+_WORK_END_EXTENDED   = 23  # 23:00
 
 # Fallback hours when estimated_time is null and complexity is unknown.
 _COMPLEXITY_HOURS: dict[int, float] = {1: 0.5, 2: 1.0, 3: 2.0, 4: 3.5, 5: 5.0}
@@ -95,11 +100,16 @@ def find_candidate_slots(
     window_end: datetime,
     min_hours: float,
     max_candidates: int = 5,
+    work_start: int = _WORK_START,
+    work_end: int = _WORK_END,
 ) -> list[dict]:
     """
     Return up to `max_candidates` free slots within [window_start, window_end]
     that are within working hours and at least `min_hours` long, scored and
     sorted best-first.
+
+    `work_start` / `work_end` (UTC hours, 0–23) control the working-hour clip.
+    Pass `_WORK_START_EXTENDED` / `_WORK_END_EXTENDED` to use the wider window.
 
     Returns an empty list when no qualifying slot exists (caller handles this
     as 'no_capacity' and surfaces it to the user).
@@ -126,7 +136,8 @@ def find_candidate_slots(
         # Iterate over each calendar day the interval spans.
         day = free_start.replace(hour=0, minute=0, second=0, microsecond=0)
         while day.date() <= free_end.date():
-            w_start, w_end = _working_bounds(day)
+            w_start = day.replace(hour=work_start, minute=0, second=0, microsecond=0)
+            w_end   = day.replace(hour=work_end,   minute=0, second=0, microsecond=0)
             sub_start = max(free_start, w_start)
             sub_end   = min(free_end,   w_end)
             duration_h = (sub_end - sub_start).total_seconds() / 3600
@@ -301,23 +312,64 @@ async def schedule_task(
     if preference_busy:
         busy.extend(preference_busy)
 
-    # ── Phase 1 ───────────────────────────────────────────────────────────
+    # ── Phase 1: primary working hours (08:00–22:00 UTC) ─────────────────
     candidates = find_candidate_slots(busy, now, deadline, hours)
+    partial = False
 
+    # ── Phase 2: graceful degradation — try extended hours (07:00–23:00) ─
+    # Triggered when the primary window is fully booked (e.g. two tasks
+    # already claimed most of the focus window for this deadline date).
     if not candidates:
-        raise ValueError("no_available_slots")
+        candidates = find_candidate_slots(
+            busy, now, deadline, hours,
+            work_start=_WORK_START_EXTENDED,
+            work_end=_WORK_END_EXTENDED,
+        )
 
-    # ── Phase 2 ───────────────────────────────────────────────────────────
+    # ── Phase 3: partial fit — best available gap even if shorter ─────────
+    # Triggered when no gap ≥ min_hours exists anywhere in the window.
+    # Rather than failing, surface the largest available slot so the user
+    # can see when to start and know the task needs to be split.
+    if not candidates:
+        any_gap = find_candidate_slots(
+            busy, now, deadline, min_hours=0.5,
+            work_start=_WORK_START_EXTENDED,
+            work_end=_WORK_END_EXTENDED,
+        )
+        if any_gap:
+            # find_candidate_slots sorts best-first; [0] is the highest-scored gap.
+            candidates = [any_gap[0]]
+            partial = True
+        else:
+            raise ValueError("no_available_slots")
+
+    # ── LLM slot selection ────────────────────────────────────────────────
     result = await pick_best_slot(
         title, tags, hours, due_date_str, candidates, constraint_summary
     )
 
     chosen = result["slot"]
+
+    # Work block end = start + task's required hours (capped to the gap end).
+    # Previously this was set to `chosen["end"]` (the full free-gap boundary),
+    # which caused every scheduled block to consume the rest of the day as
+    # busy time — preventing subsequent tasks from finding any open slots.
+    slot_hours    = min(hours, chosen["duration_hours"])
+    work_end_time = chosen["start"] + timedelta(hours=slot_hours)
+
+    reasoning = result["reasoning"]
+    if partial:
+        reasoning = (
+            f"⚠ Partial fit: only {chosen['duration_hours']:.1f} h available "
+            f"({hours:.1f} h needed) — consider splitting this task across "
+            f"multiple sessions. {reasoning}"
+        )
+
     return {
         "task_id":      task_id,
         "start_time":   chosen["start"].isoformat(),
-        "end_time":     chosen["end"].isoformat(),
-        "ai_reasoning": result["reasoning"],
+        "end_time":     work_end_time.isoformat(),
+        "ai_reasoning": reasoning,
         "confidence":   result["confidence"],
         "status":       "suggested",
     }
